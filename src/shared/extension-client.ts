@@ -1,4 +1,15 @@
-﻿import type { BridgeSettings, BridgeState, ChatMessage, OutputEvent, UiCommand, UiResponse } from './types';
+import type {
+  BridgeSettings,
+  BridgeState,
+  ChatMessage,
+  DebugSummary,
+  OriginPermissionEntry,
+  OutputEvent,
+  Recording,
+  SitePermissions,
+  UiCommand,
+  UiResponse,
+} from './types';
 import { defaultSettings } from './types';
 
 export async function sendCommand<T>(command: UiCommand): Promise<T> {
@@ -17,6 +28,26 @@ export async function getChat(): Promise<ChatMessage[]> {
 
 export async function getOutputs(): Promise<OutputEvent[]> {
   return sendCommand<OutputEvent[]>({ type: 'getOutputs' });
+}
+
+export async function getDebug(tabId?: number): Promise<DebugSummary> {
+  return sendCommand<DebugSummary>({ type: 'getDebug', tabId });
+}
+
+export async function getRecordings(): Promise<Recording[]> {
+  return sendCommand<Recording[]>({ type: 'getRecordings' });
+}
+
+export async function getPermissionEntries(): Promise<OriginPermissionEntry[]> {
+  return sendCommand<OriginPermissionEntry[]>({ type: 'getPermissions' });
+}
+
+export async function setPermission(origin: string, perms: Partial<SitePermissions>): Promise<OriginPermissionEntry[]> {
+  return sendCommand<OriginPermissionEntry[]>({ type: 'setPermission', origin, perms });
+}
+
+export async function removePermission(origin: string): Promise<OriginPermissionEntry[]> {
+  return sendCommand<OriginPermissionEntry[]>({ type: 'removePermission', origin });
 }
 
 export async function getSettings(): Promise<BridgeSettings> {

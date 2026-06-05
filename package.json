@@ -1,6 +1,6 @@
 {
   "name": "roder-chrome",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Chrome extension bridge for collaborative Roder/Gode browser control.",
   "type": "module",
@@ -8,21 +8,23 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build && node scripts-write-manifest.mjs",
     "preview": "vite preview --host 127.0.0.1",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "typescript": "latest",
+    "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lucide-react": "latest"
+    "typescript": "latest",
+    "vite": "latest"
   },
   "devDependencies": {
     "@types/chrome": "latest",
     "@types/node": "latest",
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "vitest": "^4.1.8"
   },
   "packageManager": "pnpm@10.32.1"
 }
