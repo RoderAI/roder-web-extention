@@ -13,3 +13,8 @@ const assets = resolve(root, 'src/assets');
 if (existsSync(assets)) {
   cpSync(assets, resolve(dist, 'assets'), { recursive: true, force: true });
 }
+
+const icons = resolve(root, 'icons');
+if (existsSync(icons)) {
+  cpSync(icons, resolve(dist, 'icons'), { recursive: true, force: true });
+}
