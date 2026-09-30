@@ -14,8 +14,8 @@ not been replaced by this evaluation.
 - Select uses a semantic DOM selection with input/change events. It verifies
   the resulting value and reports `method: DOM selection`, `eventsTrusted: false`.
   Native select popups on macOS did not respond to CDP keys in the evaluation.
-- Element references live in the isolated content-script world, use a document
-  UUID, and reject stale or ambiguous targets. Page attributes cannot forge them.
+- Element references live in the isolated content-script world, use a cryptographic document
+  nonce, and reject stale or ambiguous targets. Page attributes cannot forge them.
 - Actions return a fresh, untrusted page observation after loading/settling.
 - Approvals bind to one concrete tab, origin and document. Execution rechecks
   current settings and site permission; switching the active tab cannot retarget
