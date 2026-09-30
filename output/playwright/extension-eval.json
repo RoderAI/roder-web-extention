@@ -1,0 +1,72 @@
+{
+  "rows": [
+    {
+      "name": "click is trusted and returns fresh observation",
+      "passed": true
+    },
+    {
+      "name": "parallel action calls serialize through their fresh observations",
+      "passed": true
+    },
+    {
+      "name": "typing uses trusted browser input and replaces text",
+      "passed": true
+    },
+    {
+      "name": "Shift plus a printable key produces trusted uppercase input",
+      "passed": true
+    },
+    {
+      "name": "readonly and ambiguous targets reject without click",
+      "passed": true
+    },
+    {
+      "name": "semantic DOM select verifies requested option and labels event provenance",
+      "passed": true
+    },
+    {
+      "name": "wheel scroll reaches the specified nested region",
+      "passed": true
+    },
+    {
+      "name": "references cannot be forged and expire across navigation",
+      "passed": true
+    },
+    {
+      "name": "inactive tab screenshot has original CSS dimensions and masks secrets",
+      "passed": true
+    },
+    {
+      "name": "Enter uses native form submission",
+      "passed": true
+    },
+    {
+      "name": "revoked interaction permission blocks browser input",
+      "passed": true
+    },
+    {
+      "name": "cancellation releases browser-applied held input before reuse",
+      "passed": true
+    },
+    {
+      "name": "cancelled screenshot removes masks before responding",
+      "passed": true
+    },
+    {
+      "name": "queued approval stays bound to its original document",
+      "passed": true
+    },
+    {
+      "name": "default active-tab approval keeps the originally authorized tab",
+      "passed": true
+    },
+    {
+      "name": "permission revocation during queued approval rejects execution",
+      "passed": true
+    },
+    {
+      "name": "isolated references work on ordinary insecure HTTP pages",
+      "passed": true
+    }
+  ]
+}

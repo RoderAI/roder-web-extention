@@ -4,9 +4,7 @@
 // Enriched page snapshot: aria roles/names, form metadata, bounding boxes,
 // viewport info, iframe boundaries, and stable element refs.
 //
-// Stable refs: each captured element is assigned a `data-roder-ref` attribute
-// (when it does not already have one) so a ref returned in a snapshot can be
-// re-resolved later for click/type/etc even if the DOM shifts.
+// References are held in the isolated content-script world and bound to this document.
 // =============================================================================
 
 import type {
@@ -21,8 +19,7 @@ import type {
 } from '../shared/protocol';
 import { safeFieldValue } from '../shared/redaction';
 
-export const REF_ATTR = 'data-roder-ref';
-let refCounter = 0;
+import { ensureRef } from './refs';
 
 const CONTROL_SELECTOR =
   'a, button, input, textarea, select, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
@@ -54,16 +51,6 @@ function selectorFor(element: Element): string {
     current = parent;
   }
   return parts.join(' > ');
-}
-
-/** Assign (or reuse) a stable ref attribute on an element. */
-export function ensureRef(element: Element): string {
-  const existing = element.getAttribute(REF_ATTR);
-  if (existing) return existing;
-  refCounter += 1;
-  const ref = `r${refCounter}`;
-  element.setAttribute(REF_ATTR, ref);
-  return ref;
 }
 
 function visibleText(element: Element): string {

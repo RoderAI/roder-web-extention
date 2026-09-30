@@ -10,6 +10,7 @@
 // =============================================================================
 
 import type { ConsoleEntry, NetworkEntry } from '../shared/protocol';
+import { checkPermission, originOf } from './permissions';
 import { redactConsoleEntry, redactNetworkEntry } from '../shared/redaction';
 
 const PROTOCOL_VERSION = '1.3';
@@ -26,6 +27,7 @@ type StreamHandler = (event: { type: 'debug/console'; tabId: number; entry: Cons
 
 const buffers = new Map<number, TabBuffers>();
 const attached = new Set<number>();
+const origins = new Map<number,string>();
 let streamHandler: StreamHandler | null = null;
 let eventListenerInstalled = false;
 let detachListenerInstalled = false;
@@ -64,6 +66,8 @@ function installDetachListener(): void {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) {
       attached.delete(source.tabId);
+      origins.delete(source.tabId);
+      buffers.delete(source.tabId);
     }
   });
 }
@@ -74,7 +78,11 @@ function installEventListener(): void {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source.tabId;
     if (tabId === undefined || !attached.has(tabId)) return;
-    handleCdpEvent(tabId, method, (params ?? {}) as Record<string, unknown>);
+    void (async()=>{
+      const tab=await chrome.tabs.get(tabId);
+      if (originOf(tab.url)!==origins.get(tabId) || !(await checkPermission(tab.url,'debugger'))) { await detach(tabId); return; }
+      handleCdpEvent(tabId, method, (params ?? {}) as Record<string, unknown>);
+    })().catch(()=>{});
   });
 }
 
@@ -195,6 +203,10 @@ function sendCommand(tabId: number, method: string, commandParams?: Record<strin
 
 /** Attach the debugger to a tab and enable the relevant CDP domains. */
 export async function attach(tabId: number): Promise<void> {
+  const tab=await chrome.tabs.get(tabId);
+  const origin=originOf(tab.url);
+  if(!origin || !(await checkPermission(tab.url,'debugger'))) throw new Error('Debugger permission is missing for this site');
+  origins.set(tabId,origin);
   installEventListener();
   installDetachListener();
   if (attached.has(tabId)) return;
@@ -220,6 +232,8 @@ export async function attach(tabId: number): Promise<void> {
 
 /** Detach the debugger from a tab. */
 export async function detach(tabId: number): Promise<void> {
+  origins.delete(tabId);
+  buffers.delete(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   await new Promise<void>((resolve) => {

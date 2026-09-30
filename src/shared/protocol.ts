@@ -345,6 +345,7 @@ export type BridgeEvent =
 export type SnapshotInclude = 'text' | 'controls' | 'forms' | 'iframes' | 'boxes';
 
 export type AgentCommand =
+  | { type: 'command/cancel'; id?:string; targetId:string }
   // chat
   | { type: 'chat'; id?: string; text: string }
   // tabs

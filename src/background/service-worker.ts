@@ -34,6 +34,9 @@ import { createId, isExtensionPage, now, safeUrl, tokenPreview } from '../shared
 import * as perms from './permissions';
 import * as dbg from './debugger';
 import * as rec from './recording';
+import { content as sendContentMessage } from './page';
+import { screenshot } from './input';
+import { bindCommand, executeBound, type BoundCommand } from './execution';
 
 let settings: BridgeSettings;
 let state: BridgeState;
@@ -41,7 +44,14 @@ let chat: ChatMessage[] = [];
 let outputs: OutputEvent[] = [];
 let socket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
-const pendingActivities = new Map<string, AgentCommand>();
+const pendingActivities = new Map<string, BoundCommand>();
+const cancelledCommands = new Set<string>();
+const runningCommands = new Map<string, AbortController>();
+function cancelCommands(): void {
+  for (const controller of runningCommands.values()) controller.abort(new Error('Browser bridge disconnected'));
+  for (const [id, bound] of pendingActivities) { updateActivity(id,'rejected'); sendAgentResult(bound.command.id,null,'Browser bridge disconnected'); }
+  pendingActivities.clear();
+}
 const troubleshooting = new Map<TroubleshootingKind, { message: string; at: number }>();
 
 // Tabs opened through the bridge are collected into a single reusable Chrome tab
@@ -88,6 +98,7 @@ async function init(): Promise<void> {
   };
 
   dbg.onDebugStream((event) => {
+    if (!settings.allowDebugger) return;
     sendToAgent(event);
     const detail =
       event.type === 'debug/console'
@@ -229,6 +240,7 @@ function connect(): void {
 
     socket.addEventListener('message', (event) => handleAgentMessage(event.data));
     socket.addEventListener('close', () => {
+      cancelCommands();
       socket = null;
       setStatus('disconnected');
       addOutput('connection', 'Disconnected from Roder', settings.endpoint);
@@ -243,6 +255,7 @@ function connect(): void {
 }
 
 function disconnect(): void {
+  cancelCommands();
   clearReconnect();
   settings = { ...settings, autoConnect: false };
   void saveSettings(settings);
@@ -299,10 +312,10 @@ function sendAgentResult(id: string | undefined, result: unknown, error?: string
 function handleAgentMessage(raw: unknown): void {
   const command = parseAgentCommand(raw);
   if (!command) {
-    addOutput('error', 'Could not parse agent command', typeof raw === 'string' ? raw.slice(0, 200) : 'non-string payload');
+    addOutput('error', 'Could not parse agent command', typeof raw === 'string' ? `Invalid string payload (${raw.length} characters)` : 'non-string payload');
     return;
   }
-  addOutput('command', `Agent command: ${command.type}`, JSON.stringify(command).slice(0, 900));
+  addOutput('command', `Agent command: ${command.type}`, `id=${command.id ?? 'none'}${'tabId' in command ? ` tab=${command.tabId ?? 'active'}` : ''}`);
   void runAgentCommand(command);
 }
 
@@ -328,6 +341,9 @@ async function gate(
   }
   setTroubleshooting('permission-denied', null);
 
+  const target = await resolveTab('tabId' in command ? command.tabId : undefined);
+  if (perms.originOf(target.url) !== perms.originOf(opts.tabUrl)) throw new Error('Active target changed during permission check');
+  const bound = await bindCommand(command, target.id, opts.sitePerm);
   const alwaysAllow = !(await perms.requiresApproval(opts.tabUrl));
   const immediate = settings.controlMode === 'control' || alwaysAllow;
 
@@ -335,7 +351,7 @@ async function gate(
     id: createId('activity'),
     kind: command.type,
     label,
-    tabId: 'tabId' in command ? command.tabId : undefined,
+    tabId: bound.tabId,
     createdAt: now(),
     status: immediate ? 'running' : 'pending',
   };
@@ -345,10 +361,11 @@ async function gate(
   publishState();
 
   if (!immediate) {
-    pendingActivities.set(activity.id, command);
+    if (bound.command.id && cancelledCommands.has(bound.command.id)) throw new Error('Browser command cancelled');
+    pendingActivities.set(activity.id, bound);
     return;
   }
-  await executePrivileged(command, activity.id);
+  await executePrivileged(bound, activity.id);
 }
 
 async function runAgentCommand(command: AgentCommand): Promise<void> {
@@ -360,6 +377,19 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
     }
 
     switch (command.type) {
+      case 'command/cancel': {
+        cancelledCommands.add(command.targetId);
+        if (cancelledCommands.size > 1000) cancelledCommands.delete(cancelledCommands.values().next().value!);
+        runningCommands.get(command.targetId)?.abort(new Error('Browser command cancelled'));
+        for (const [id,bound] of pendingActivities) {
+          if (bound.command.id !== command.targetId) continue;
+          pendingActivities.delete(id);
+          updateActivity(id,'rejected');
+          sendAgentResult(bound.command.id,null,'Browser command cancelled');
+        }
+        sendAgentResult(command.id,{ cancelled:command.targetId });
+        return;
+      }
       // ---- chat ----
       case 'chat':
         await addChat('agent', command.text);
@@ -404,7 +434,7 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
       // ---- navigation (privileged) ----
       case 'tab/navigate': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Navigate tab', { modeAllowed: settings.allowNavigation, sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Navigate tab', { modeAllowed: settings.allowNavigation, sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
 
@@ -428,45 +458,51 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
       case 'page/screenshot': {
         const tab = await resolveTab(command.tabId);
         await ensureInspectAllowed(tab.url);
-        const dataUrl = await captureScreenshot(tab.windowId, command.region);
-        addOutput('screenshot', `Screenshot: ${tab.title ?? tab.url ?? 'tab'}`, command.region ? 'full capture (region crop unsupported in MV3 SW)' : 'full capture');
-        sendAgentResult(command.id, {
-          dataUrl,
-          untrusted: true,
-          note: command.region ? 'Region cropping is not supported in an MV3 service worker (no DOM canvas); full visible-tab capture returned.' : undefined,
-        });
+        const controller=new AbortController();
+        if(command.id) runningCommands.set(command.id,controller);
+        let result:unknown;
+        try {
+          if(command.id && cancelledCommands.has(command.id)) controller.abort(new Error('Browser command cancelled'));
+          result = await screenshot(tab.id, async () => {
+            const actual = await chrome.tabs.get(tab.id);
+            if (perms.originOf(actual.url) !== perms.originOf(tab.url)) throw new Error('Screenshot target origin changed');
+            await ensureInspectAllowed(actual.url);
+          }, command.region, controller.signal);
+        } finally { if(command.id) runningCommands.delete(command.id); }
+        addOutput('screenshot', `Screenshot: ${tab.title ?? 'tab'}`, 'Targeted CSS viewport capture');
+        sendAgentResult(command.id, result);
         return;
       }
 
       // ---- interact (privileged) ----
       case 'page/highlight': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Highlight element', { modeAllowed: settings.allowPageInspection, sitePerm: 'inspect', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Highlight element', { modeAllowed: settings.allowPageInspection, sitePerm: 'inspect', tabUrl: tab.url });
         return;
       }
       case 'page/click': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Click element', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Click element', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
       case 'page/type': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Type into element', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Type into element', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
       case 'page/keypress': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Send keypress', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Send keypress', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
       case 'page/scroll': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Scroll page', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Scroll page', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
       case 'page/select': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Select option', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Select option', { modeAllowed: settings.allowInput && settings.controlMode === 'control', sitePerm: 'interact', tabUrl: tab.url });
         return;
       }
       case 'page/upload': {
@@ -476,14 +512,14 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
       }
       case 'page/eval': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Evaluate script', { modeAllowed: settings.allowEval && settings.controlMode === 'control', sitePerm: 'eval', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Evaluate script', { modeAllowed: settings.allowEval && settings.controlMode === 'control', sitePerm: 'eval', tabUrl: tab.url });
         return;
       }
 
       // ---- debug ----
       case 'debug/attach': {
         const tab = await resolveTab(command.tabId);
-        await gate(command, 'Attach debugger', { modeAllowed: settings.allowDebugger, sitePerm: 'debugger', tabUrl: tab.url });
+        await gate({ ...command, tabId:tab.id }, 'Attach debugger', { modeAllowed: settings.allowDebugger, sitePerm: 'debugger', tabUrl: tab.url });
         return;
       }
       case 'debug/detach': {
@@ -495,11 +531,13 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
       }
       case 'debug/console/read': {
         const tab = await resolveTab(command.tabId);
+        await ensureDebugAllowed(tab.url);
         sendAgentResult(command.id, { entries: dbg.readConsole(tab.id, command.limit) });
         return;
       }
       case 'debug/network/read': {
         const tab = await resolveTab(command.tabId);
+        await ensureDebugAllowed(tab.url);
         sendAgentResult(command.id, { entries: dbg.readNetwork(tab.id, command.limit) });
         return;
       }
@@ -549,6 +587,10 @@ async function runAgentCommand(command: AgentCommand): Promise<void> {
   }
 }
 
+async function ensureDebugAllowed(url:string|undefined):Promise<void> {
+  if(!settings.allowDebugger || !(await perms.checkPermission(url,'debugger'))) throw new Error('Debugger inspection is disabled for this site');
+}
+
 async function ensureInspectAllowed(url: string | undefined): Promise<void> {
   if (!settings.allowPageInspection) throw new Error('Page inspection is disabled by the user.');
   if (!(await perms.checkPermission(url, 'inspect'))) {
@@ -558,110 +600,24 @@ async function ensureInspectAllowed(url: string | undefined): Promise<void> {
   setTroubleshooting('permission-denied', null);
 }
 
-async function captureScreenshot(windowId: number, region?: unknown): Promise<string> {
-  void region; // region cropping unsupported in SW; documented in result note.
-  return chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-}
-
-// -----------------------------------------------------------------------------
-// Privileged execution (called immediately in control mode or after approval)
-// -----------------------------------------------------------------------------
-
-async function executePrivileged(command: AgentCommand, activityId: string): Promise<void> {
+// Bound execution keeps approvals attached to one tab/document and rechecks
+// current settings and site permission immediately before browser input.
+async function executePrivileged(bound: BoundCommand, activityId: string): Promise<void> {
+  const controller = new AbortController();
+  if (bound.command.id && cancelledCommands.has(bound.command.id)) controller.abort(new Error('Browser command cancelled'));
+  if (bound.command.id) runningCommands.set(bound.command.id,controller);
   try {
-    let result: unknown;
-    switch (command.type) {
-      case 'tab/navigate': {
-        const tab = await resolveTab(command.tabId);
-        const url = safeUrl(command.url);
-        if (!url) throw new Error('Only http(s) navigation is allowed.');
-        result = await chrome.tabs.update(tab.id, { url });
-        rec.recordAction('tab/navigate', tab.id, { url });
-        break;
-      }
-      case 'page/highlight': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'highlight', selector: command.selector, text: command.text, ref: command.ref });
-        break;
-      }
-      case 'page/click': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'click', selector: command.selector, text: command.text, ref: command.ref });
-        rec.recordAction('page/click', tab.id, { selector: command.selector, text: command.text, ref: command.ref });
-        break;
-      }
-      case 'page/type': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'type', selector: command.selector, ref: command.ref, text: command.text, submit: command.submit });
-        rec.recordAction('page/type', tab.id, { selector: command.selector, ref: command.ref, submit: command.submit });
-        break;
-      }
-      case 'page/keypress': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'keypress', key: command.key });
-        rec.recordAction('page/keypress', tab.id, { key: command.key });
-        break;
-      }
-      case 'page/scroll': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'scroll', selector: command.selector, dx: command.dx, dy: command.dy });
-        rec.recordAction('page/scroll', tab.id, { dx: command.dx, dy: command.dy });
-        break;
-      }
-      case 'page/select': {
-        const tab = await resolveTab(command.tabId);
-        result = await sendContentMessage(tab.id, { type: 'select', selector: command.selector, value: command.value });
-        rec.recordAction('page/select', tab.id, { selector: command.selector });
-        break;
-      }
-      case 'page/eval': {
-        const tab = await resolveTab(command.tabId);
-        result = await evalInTab(tab.id, command.expression);
-        rec.recordAction('page/eval', tab.id, { expression: command.expression.slice(0, 120) });
-        break;
-      }
-      case 'debug/attach': {
-        const tab = await resolveTab(command.tabId);
-        try {
-          await dbg.attach(tab.id);
-        } catch (error) {
-          setTroubleshooting('debugger-attach-blocked', error instanceof Error ? error.message : String(error));
-          throw error;
-        }
-        setTroubleshooting('debugger-attach-blocked', null);
-        syncDebuggerTabs();
-        result = { attached: tab.id };
-        break;
-      }
-      default:
-        throw new Error(`Cannot execute command: ${(command as { type: string }).type}`);
-    }
+    const result = await executeBound(bound, () => settings, controller.signal);
+    if (bound.command.type === 'debug/attach') syncDebuggerTabs();
+    rec.recordAction(bound.command.type, bound.tabId, { commandId:bound.command.id });
     updateActivity(activityId, 'completed');
-    sendAgentResult(command.id, result ?? { ok: true });
+    sendAgentResult(bound.command.id, result);
   } catch (error) {
     updateActivity(activityId, 'failed');
-    sendAgentResult(command.id, null, error instanceof Error ? error.message : String(error));
+    sendAgentResult(bound.command.id, null, error instanceof Error ? error.message : String(error));
+  } finally {
+    if (bound.command.id && runningCommands.get(bound.command.id) === controller) runningCommands.delete(bound.command.id);
   }
-}
-
-async function evalInTab(tabId: number, expression: string): Promise<unknown> {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    func: (code: string) => {
-      try {
-        // eslint-disable-next-line no-new-func
-        const value = new Function(`return (${code})`)();
-        return { ok: true, value: typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value };
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    },
-    args: [expression],
-  });
-  const out = injection?.result as { ok: boolean; value?: unknown; error?: string } | undefined;
-  if (!out?.ok) throw new Error(out?.error ?? 'Evaluation failed.');
-  return { value: out.value, untrusted: true };
 }
 
 function updateActivity(id: string, status: AgentActivity['status']): void {
@@ -672,25 +628,6 @@ function updateActivity(id: string, status: AgentActivity['status']): void {
     addOutput('activity', updated.label, updated.kind, status, id);
     publishState();
   }
-}
-
-// -----------------------------------------------------------------------------
-// Content-script messaging
-// -----------------------------------------------------------------------------
-
-async function ensureContentScript(tabId: number): Promise<void> {
-  try {
-    await chrome.tabs.sendMessage(tabId, { type: 'ping' });
-  } catch {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content/content-script.js'] });
-  }
-}
-
-async function sendContentMessage(tabId: number, message: Record<string, unknown>): Promise<any> {
-  await ensureContentScript(tabId);
-  const response = await chrome.tabs.sendMessage(tabId, message);
-  if (!response?.ok) throw new Error(response?.error ?? 'Content script command failed.');
-  return response;
 }
 
 // -----------------------------------------------------------------------------
@@ -778,7 +715,7 @@ chrome.runtime.onMessage.addListener((command: UiCommand, _sender, sendResponse:
           const pending = pendingActivities.get(command.id);
           pendingActivities.delete(command.id);
           updateActivity(command.id, 'rejected');
-          sendAgentResult(pending?.id, null, 'Rejected by user.');
+          sendAgentResult(pending?.command.id, null, 'Rejected by user.');
           sendResponse({ ok: true, data: state });
           break;
         }

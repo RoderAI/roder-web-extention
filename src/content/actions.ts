@@ -1,123 +1,130 @@
-/// <reference types="chrome" />
-
-// =============================================================================
-// In-page actions: click / type / keypress / scroll / select / highlight,
-// resolvable by CSS selector, visible text, or stable ref (data-roder-ref).
-// =============================================================================
-
-import { REF_ATTR, ensureRef } from './snapshot';
-
-const FOCUSABLE_SELECTOR =
-  'a, button, input, textarea, select, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
-
-function findByText(text: string): HTMLElement | null {
-  const normalized = text.trim().toLowerCase();
-  const nodes = document.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
+import { ensureRef, resolveRef } from "./refs";
+type Target = { ref?: string; selector?: string; text?: string };
+function visible(element: HTMLElement): boolean {
+  const box = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
   return (
-    Array.from(nodes).find((node) => {
-      const label = `${node.innerText} ${node.getAttribute('aria-label') ?? ''} ${(node as HTMLInputElement).placeholder ?? ''}`.toLowerCase();
-      return label.includes(normalized);
-    }) ?? null
+    box.width > 0 &&
+    box.height > 0 &&
+    style.display !== "none" &&
+    style.visibility !== "hidden"
   );
 }
-
-function findByRef(ref: string): HTMLElement | null {
-  return document.querySelector<HTMLElement>(`[${REF_ATTR}="${CSS.escape(ref)}"]`);
+export function resolveTarget(opts: Target): HTMLElement {
+  let candidates: HTMLElement[];
+  if (opts.ref)
+    candidates = [resolveRef(opts.ref)].filter((e): e is HTMLElement => !!e);
+  else if (opts.selector)
+    candidates = Array.from(
+      document.querySelectorAll<HTMLElement>(opts.selector),
+    );
+  else if (opts.text?.trim()) {
+    const text = opts.text.trim().toLowerCase();
+    candidates = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        'a,button,input,textarea,select,[role="button"],[role="link"]',
+      ),
+    ).filter((e) =>
+      `${e.innerText} ${e.getAttribute("aria-label") ?? ""} ${(e as HTMLInputElement).placeholder ?? ""}`
+        .toLowerCase()
+        .includes(text),
+    );
+  } else throw new Error("An element target is required");
+  candidates = candidates.filter(visible);
+  if (candidates.length !== 1)
+    throw new Error(
+      candidates.length
+        ? "Ambiguous element target"
+        : "No matching visible element",
+    );
+  return candidates[0];
 }
-
-/** Resolve a target element from any of ref | selector | text. */
-export function resolveTarget(opts: { ref?: string; selector?: string; text?: string }): HTMLElement | null {
-  if (opts.ref) return findByRef(opts.ref);
-  if (opts.selector) return document.querySelector<HTMLElement>(opts.selector);
-  if (opts.text) return findByText(opts.text);
-  return null;
+export function probe(
+  opts: Target & { editing?: boolean },
+): Record<string, unknown> {
+  const target = resolveTarget(opts);
+  if (
+    target.matches(":disabled") ||
+    target.getAttribute("aria-disabled") === "true"
+  )
+    throw new Error("Target is disabled");
+  if (opts.editing) {
+    const editable =
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLInputElement &&
+        [
+          "text",
+          "search",
+          "email",
+          "url",
+          "tel",
+          "password",
+          "number",
+        ].includes(target.type)) ||
+      target.isContentEditable;
+    if (!editable || ("readOnly" in target && target.readOnly))
+      throw new Error("Target is not editable");
+  }
+  target.scrollIntoView({
+    behavior: "instant",
+    block: "center",
+    inline: "center",
+  });
+  const box = target.getBoundingClientRect();
+  const x =
+    Math.max(0, box.left) +
+    (Math.min(innerWidth, box.right) - Math.max(0, box.left)) / 2;
+  const y =
+    Math.max(0, box.top) +
+    (Math.min(innerHeight, box.bottom) - Math.max(0, box.top)) / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (!hit || !(target === hit || target.contains(hit)))
+    throw new Error("Target is covered or outside the viewport");
+  return { ref: ensureRef(target), x, y };
 }
-
-export function flash(element: HTMLElement): void {
-  const previousOutline = element.style.outline;
-  const previousBoxShadow = element.style.boxShadow;
-  element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-  element.style.outline = '3px solid #1a73e8';
-  element.style.boxShadow = '0 0 0 6px rgba(26,115,232,0.25)';
+export function focused(ref: string): Record<string, unknown> {
+  const target = resolveRef(ref);
+  return {
+    focused:
+      !!target &&
+      (document.activeElement === target ||
+        target.contains(document.activeElement)),
+    value: target instanceof HTMLSelectElement ? target.value : undefined,
+  };
+}
+export function highlight(opts: Target): Record<string, unknown> {
+  const target = resolveTarget(opts);
+  const previous = target.style.outline;
+  target.style.outline = "3px solid #1a73e8";
   setTimeout(() => {
-    element.style.outline = previousOutline;
-    element.style.boxShadow = previousBoxShadow;
+    target.style.outline = previous;
   }, 1800);
-}
-
-export function highlight(opts: { ref?: string; selector?: string; text?: string }): { ref: string } {
-  const target = resolveTarget(opts);
-  if (!target) throw new Error('No matching element found');
-  flash(target);
   return { ref: ensureRef(target) };
 }
 
-export function click(opts: { ref?: string; selector?: string; text?: string }): { ref: string } {
+// A semantic DOM selection is distinct from a native keyboard gesture. Chromium
+// does not route tab-targeted CDP keys through macOS native select popups.
+export function selectOption(opts: {
+  selector: string;
+  value: string;
+}): Record<string, unknown> {
   const target = resolveTarget(opts);
-  if (!target) throw new Error('No matching element found');
-  flash(target);
-  const ref = ensureRef(target);
-  setTimeout(() => target.click(), 150);
-  return { ref };
-}
-
-export function type(opts: { ref?: string; selector?: string; text: string; submit?: boolean }): { ref: string } {
-  const target = resolveTarget(opts) as (HTMLInputElement | HTMLTextAreaElement | HTMLElement) | null;
-  if (!target) throw new Error('No editable element found');
-  flash(target);
-  target.focus();
-
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-    target.value = opts.text;
-    target.dispatchEvent(new Event('input', { bubbles: true }));
-    target.dispatchEvent(new Event('change', { bubbles: true }));
-  } else if (target.isContentEditable) {
-    target.textContent = opts.text;
-    target.dispatchEvent(new Event('input', { bubbles: true }));
-  } else {
-    throw new Error('Target is not editable');
-  }
-
-  if (opts.submit) {
-    const form = (target as HTMLInputElement).form;
-    if (form) {
-      form.requestSubmit?.();
-    } else {
-      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-    }
-  }
-  return { ref: ensureRef(target) };
-}
-
-export function keypress(key: string): { key: string } {
-  const target = (document.activeElement as HTMLElement | null) ?? document.body;
-  const init: KeyboardEventInit = { key, bubbles: true, cancelable: true };
-  target.dispatchEvent(new KeyboardEvent('keydown', init));
-  target.dispatchEvent(new KeyboardEvent('keypress', init));
-  target.dispatchEvent(new KeyboardEvent('keyup', init));
-  return { key };
-}
-
-export function scroll(opts: { selector?: string; dx?: number; dy?: number }): { scrolled: true } {
-  const dx = opts.dx ?? 0;
-  const dy = opts.dy ?? 0;
-  if (opts.selector) {
-    const el = document.querySelector<HTMLElement>(opts.selector);
-    if (!el) throw new Error('No matching element to scroll');
-    el.scrollBy({ left: dx, top: dy, behavior: 'smooth' });
-  } else {
-    window.scrollBy({ left: dx, top: dy, behavior: 'smooth' });
-  }
-  return { scrolled: true };
-}
-
-export function select(opts: { selector: string; value: string }): { value: string } {
-  const el = document.querySelector<HTMLSelectElement>(opts.selector);
-  if (!el || el.tagName !== 'SELECT') throw new Error('No matching <select> element found');
-  flash(el);
-  el.value = opts.value;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  return { value: el.value };
+  if (!(target instanceof HTMLSelectElement) || target.disabled)
+    throw new Error("Target is not an enabled select");
+  const option = Array.from(target.options).find(
+    (o) =>
+      o.value === opts.value &&
+      !o.disabled &&
+      !(
+        o.parentElement instanceof HTMLOptGroupElement &&
+        o.parentElement.disabled
+      ),
+  );
+  if (!option) throw new Error("No enabled option has that value");
+  target.value = opts.value;
+  target.dispatchEvent(new Event("input", { bubbles: true }));
+  target.dispatchEvent(new Event("change", { bubbles: true }));
+  if (target.value !== opts.value)
+    throw new Error("Page rejected the requested selection");
+  return { value: target.value, method: "DOM selection", eventsTrusted: false };
 }
